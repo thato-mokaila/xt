@@ -27,6 +27,9 @@ func TestStoreStatementSearchAndTransactions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("InsertStatement() error = %v", err)
 	}
+	if statement.ID != 2607 {
+		t.Fatalf("statement.ID = %d, want 2607", statement.ID)
+	}
 
 	err = store.InsertTransactions(ctx, []Transaction{
 		{StatementID: statement.ID, Date: "2026-08-20", Bucket: BucketCost, Category: "groceries", Description: "Market", AmountCents: -4210},
@@ -99,15 +102,15 @@ func TestStoreStatementSearchAndTransactions(t *testing.T) {
 		t.Fatalf("calculated balance = %d, want 395790", calculated.BalanceCents)
 	}
 
-	monthlyStatement, ok, err := store.StatementForMonth(ctx, "2026-08-01")
+	monthlyStatement, ok, err := store.StatementForStatementPeriod(ctx, "2026-08-01")
 	if err != nil {
-		t.Fatalf("StatementForMonth() error = %v", err)
+		t.Fatalf("StatementForStatementPeriod() error = %v", err)
 	}
 	if !ok {
-		t.Fatal("StatementForMonth() ok = false, want true")
+		t.Fatal("StatementForStatementPeriod() ok = false, want true")
 	}
 	if monthlyStatement.ID != statement.ID {
-		t.Fatalf("StatementForMonth() id = %d, want %d", monthlyStatement.ID, statement.ID)
+		t.Fatalf("StatementForStatementPeriod() id = %d, want %d", monthlyStatement.ID, statement.ID)
 	}
 }
 
@@ -155,6 +158,25 @@ func TestDeleteStatementCascadesTransactions(t *testing.T) {
 	}
 	if len(transactions) != 0 {
 		t.Fatalf("Transactions() returned %d rows, want 0", len(transactions))
+	}
+}
+
+func TestStatementPeriodID(t *testing.T) {
+	tests := map[string]int64{
+		"2026-08-20": 2607,
+		"2026-08-21": 2608,
+		"2026-09-20": 2608,
+		"2026-09-21": 2609,
+	}
+
+	for input, want := range tests {
+		got, err := StatementPeriodID(input)
+		if err != nil {
+			t.Fatalf("StatementPeriodID(%q) error = %v", input, err)
+		}
+		if got != want {
+			t.Fatalf("StatementPeriodID(%q) = %d, want %d", input, got, want)
+		}
 	}
 }
 

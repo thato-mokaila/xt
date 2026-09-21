@@ -93,9 +93,6 @@ func LoadTransactionsCSV(path string, statementID int64) ([]Transaction, error) 
 		if err := applyTransactionRecord(&transaction, headerIndex, record); err != nil {
 			return nil, fmt.Errorf("transaction csv line %d: %w", line, err)
 		}
-		if transaction.StatementID == 0 {
-			return nil, fmt.Errorf("transaction csv line %d: statement_id is required", line)
-		}
 		transactions = append(transactions, transaction)
 	}
 

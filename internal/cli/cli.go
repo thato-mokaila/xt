@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"budgeter/internal/storage"
-	"budgeter/internal/ui"
+	"xt/internal/storage"
+	"xt/internal/ui"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -143,7 +143,7 @@ func (c *CLI) runStatementLoad(ctx context.Context, store *storage.Store, args [
 		if len(statements) == 0 {
 			return fmt.Errorf("no statements found in %s", *file)
 		}
-		if err := ensureStatementLoadMonthsAvailable(ctx, store, statements); err != nil {
+		if err := ensureStatementLoadPeriodsAvailable(ctx, store, statements); err != nil {
 			return err
 		}
 
@@ -199,7 +199,7 @@ func (c *CLI) runStatementLoad(ctx context.Context, store *storage.Store, args [
 		}
 		arg.set(cents)
 	}
-	if err := ensureStatementLoadMonthsAvailable(ctx, store, []storage.Statement{statement}); err != nil {
+	if err := ensureStatementLoadPeriodsAvailable(ctx, store, []storage.Statement{statement}); err != nil {
 		return err
 	}
 
@@ -207,7 +207,11 @@ func (c *CLI) runStatementLoad(ctx context.Context, store *storage.Store, args [
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(c.out, "%s Loaded statement #%d for %s.\n", successStyle.Render("OK"), inserted.ID, inserted.Date)
+	_, _, period, err := storage.StatementPeriodRange(inserted.Date)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(c.out, "%s Loaded statement #%d for %s (statement period %s).\n", successStyle.Render("OK"), inserted.ID, inserted.Date, period)
 	return nil
 }
 
@@ -417,18 +421,6 @@ func (c *CLI) runTransactionLoad(ctx context.Context, store *storage.Store, args
 		}
 		*statementID = parsed
 	}
-	if *statementID == 0 {
-		return fmt.Errorf("statement id is required")
-	}
-
-	exists, err := store.StatementExists(ctx, *statementID)
-	if err != nil {
-		return err
-	}
-	if !exists {
-		return fmt.Errorf("statement #%d was not found", *statementID)
-	}
-
 	if *file != "" {
 		transactions, err := storage.LoadTransactionsCSV(*file, *statementID)
 		if err != nil {
@@ -437,10 +429,18 @@ func (c *CLI) runTransactionLoad(ctx context.Context, store *storage.Store, args
 		if len(transactions) == 0 {
 			return fmt.Errorf("no transactions found in %s", *file)
 		}
+		created, err := c.ensureTransactionStatements(ctx, store, transactions, *statementID)
+		if err != nil {
+			return err
+		}
 		if err := store.InsertTransactions(ctx, transactions); err != nil {
 			return err
 		}
-		fmt.Fprintf(c.out, "%s Loaded %d transaction(s) for statement #%d.\n", successStyle.Render("OK"), len(transactions), *statementID)
+		fmt.Fprintf(c.out, "%s Loaded %d transaction(s) across %d statement(s)", successStyle.Render("OK"), len(transactions), countTransactionStatements(transactions))
+		if created > 0 {
+			fmt.Fprintf(c.out, "; created %d statement(s)", created)
+		}
+		fmt.Fprintln(c.out, ".")
 		return nil
 	}
 
@@ -475,9 +475,13 @@ func (c *CLI) runTransactionLoad(ctx context.Context, store *storage.Store, args
 	if *description == "" {
 		*description = *descriptionAlias
 	}
+	statementIDForDate, created, err := c.ensureTransactionStatement(ctx, store, transactionDate, *statementID)
+	if err != nil {
+		return err
+	}
 
 	transaction := storage.Transaction{
-		StatementID: *statementID,
+		StatementID: statementIDForDate,
 		Date:        transactionDate,
 		Bucket:      normalizedBucket,
 		Category:    normalizedCategory,
@@ -487,7 +491,11 @@ func (c *CLI) runTransactionLoad(ctx context.Context, store *storage.Store, args
 	if err := store.InsertTransactions(ctx, []storage.Transaction{transaction}); err != nil {
 		return err
 	}
-	fmt.Fprintf(c.out, "%s Loaded transaction for statement #%d.\n", successStyle.Render("OK"), *statementID)
+	fmt.Fprintf(c.out, "%s Loaded transaction for statement #%d", successStyle.Render("OK"), statementIDForDate)
+	if created {
+		fmt.Fprint(c.out, " (created statement)")
+	}
+	fmt.Fprintln(c.out, ".")
 	return nil
 }
 
@@ -546,6 +554,58 @@ func (c *CLI) runTransactionList(ctx context.Context, store *storage.Store, args
 	}
 
 	return c.renderStatement("Statement transactions", []storage.Statement{statement}, statement, transactions, mode)
+}
+
+func (c *CLI) ensureTransactionStatements(ctx context.Context, store *storage.Store, transactions []storage.Transaction, requestedStatementID int64) (int, error) {
+	created := 0
+	seen := map[int64]bool{}
+	for i := range transactions {
+		statementID, wasCreated, err := c.ensureTransactionStatement(ctx, store, transactions[i].Date, requestedStatementID)
+		if err != nil {
+			return 0, err
+		}
+		transactions[i].StatementID = statementID
+		if wasCreated && !seen[statementID] {
+			created++
+			seen[statementID] = true
+		}
+	}
+	return created, nil
+}
+
+func (c *CLI) ensureTransactionStatement(ctx context.Context, store *storage.Store, transactionDate string, requestedStatementID int64) (int64, bool, error) {
+	statementID, err := storage.StatementPeriodID(transactionDate)
+	if err != nil {
+		return 0, false, err
+	}
+	if requestedStatementID != 0 && requestedStatementID != statementID {
+		_, _, period, err := storage.StatementPeriodRange(transactionDate)
+		if err != nil {
+			return 0, false, err
+		}
+		return 0, false, fmt.Errorf("statement #%d does not match transaction date %s; expected statement #%d for statement period %s", requestedStatementID, transactionDate, statementID, period)
+	}
+
+	existing, ok, err := store.StatementForStatementPeriod(ctx, transactionDate)
+	if err != nil {
+		return 0, false, err
+	}
+	if ok {
+		return existing.ID, false, nil
+	}
+
+	if _, err := store.InsertStatement(ctx, storage.Statement{Date: transactionDate}); err != nil {
+		return 0, false, err
+	}
+	return statementID, true, nil
+}
+
+func countTransactionStatements(transactions []storage.Transaction) int {
+	seen := map[int64]bool{}
+	for _, transaction := range transactions {
+		seen[transaction.StatementID] = true
+	}
+	return len(seen)
 }
 
 func (c *CLI) calculatedStatements(ctx context.Context, store *storage.Store, statements []storage.Statement) ([]storage.Statement, error) {
@@ -669,7 +729,7 @@ func buildStatementFilter(id int64, account string, from string, to string, minB
 	return filter, nil
 }
 
-func ensureStatementLoadMonthsAvailable(ctx context.Context, store *storage.Store, statements []storage.Statement) error {
+func ensureStatementLoadPeriodsAvailable(ctx context.Context, store *storage.Store, statements []storage.Statement) error {
 	seen := map[string]int{}
 	for i, statement := range statements {
 		date := statement.Date
@@ -677,23 +737,23 @@ func ensureStatementLoadMonthsAvailable(ctx context.Context, store *storage.Stor
 			date = storage.Today()
 		}
 
-		_, _, month, err := storage.MonthRange(date)
+		_, _, period, err := storage.StatementPeriodRange(date)
 		if err != nil {
 			return err
 		}
-		if previous, ok := seen[month]; ok {
-			return fmt.Errorf("statement load includes multiple statements for %s at rows %d and %d", month, previous+1, i+1)
+		if previous, ok := seen[period]; ok {
+			return fmt.Errorf("statement load includes multiple statements for statement period %s at rows %d and %d", period, previous+1, i+1)
 		}
 
-		existing, ok, err := store.StatementForMonth(ctx, date)
+		existing, ok, err := store.StatementForStatementPeriod(ctx, date)
 		if err != nil {
 			return err
 		}
 		if ok {
-			return fmt.Errorf("statement #%d already exists for %s (%s); delete it before loading another statement for that month", existing.ID, month, existing.Date)
+			return fmt.Errorf("statement #%d already exists for statement period %s (%s); delete it before loading another statement for that period", existing.ID, period, existing.Date)
 		}
 
-		seen[month] = i
+		seen[period] = i
 	}
 	return nil
 }
@@ -752,11 +812,11 @@ Commands:
 
 Examples:
   budgeter statement load --date 2026-08-20 --account cheque --balance 12000.00
-  budgeter statement tx load --statement-id 1 --date 2026-08-20 --bucket cost --category Groceries --desc "Market" --amount -42.10
+  budgeter statement tx load --date 2026-08-23 --bucket cost --category Groceries --desc "Market" --amount -42.10
   budgeter statement list --limit 25
-  budgeter statement delete --id 1 --yes
+  budgeter statement delete --id 2607 --yes
   budgeter statement search --account cheque --from 2026-08-01 --top-10
-  budgeter statement tx --statement-id 1 --bucket cost --category Groceries --all
+  budgeter statement tx --statement-id 2607 --bucket cost --category Groceries --all
 `) + "\n"
 }
 
@@ -771,9 +831,10 @@ Statement commands:
   search            Search statements with --id, --account, --from, --to, --min-balance, --max-balance, --limit.
   show              Show a statement by --id.
   tx                Show transaction rows for a statement. Supports --bucket and --category filters.
-  tx load           Load transactions for a statement.
+  tx load           Load transactions. Missing statements are created from transaction dates.
 
-Statement load rejects a new statement when one already exists for the statement month.
+Statement load rejects a new statement when one already exists for the statement period. Statement periods run from the 21st through the 20th of the following month.
+Transaction loads use each transaction date to find or create the matching statement.
 
 Transaction read flags:
   --all

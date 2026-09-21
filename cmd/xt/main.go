@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"budgeter/internal/cli"
+	"xt/internal/cli"
 )
 
 func main() {

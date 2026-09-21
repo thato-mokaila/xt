@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"budgeter/internal/storage"
+	"xt/internal/storage"
 
 	"github.com/charmbracelet/bubbles/table"
 	tea "github.com/charmbracelet/bubbletea"
